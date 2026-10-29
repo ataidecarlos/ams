@@ -41,19 +41,23 @@ pub fn tool_remember(conn: &Connection, args: &Value) -> Result<String, String> 
     let content = req_str(args, "content")?;
     let content = db::truncate_chars(content, MAX_CONTENT_CHARS);
 
-    // Exact duplicate: keep the raw record for the audit trail, but do not
-    // create a second searchable memory.
+    // Exact duplicate: keep the raw record for the audit trail, and treat the
+    // rediscovery as validation — same signal Copilot Memory calls upvoting
+    // instead of storing a duplicate.
     if let Some(id) = db::find_duplicate(conn, agent, &db::content_hash(&content))
         .map_err(|e| e.to_string())?
     {
         let raw = db::insert_raw(conn, agent, project, kind, scope, &content, session)
             .map_err(|e| e.to_string())?;
         db::mark_raw_consumed(conn, &[raw]).map_err(|e| e.to_string())?;
+        let counts = db::cast_vote(conn, id, agent, session, 1, "duplicate write").ok();
         return Ok(json!({
             "memory_id": id,
             "duplicate": true,
             "status": "duplicate",
-            "message": "an identical memory already exists"
+            "upvoted": counts.is_some(),
+            "upvotes": counts.map(|c| c.up),
+            "message": "an identical memory already exists; it was confirmed instead"
         })
         .to_string());
     }
@@ -66,8 +70,15 @@ pub fn tool_remember(conn: &Connection, args: &Value) -> Result<String, String> 
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let raw = db::insert_raw(&tx, agent, project, kind, scope, &content, session)
         .map_err(|e| e.to_string())?;
+    // Fresh memories expire unless an upvote reinforces them; procedures are
+    // exempt because a verified procedure is the most durable kind of memory.
+    let expires_at = if kind == "procedure" {
+        None
+    } else {
+        Some(db::now() + db::ttl_secs())
+    };
     let id = db::insert_memory(
-        &tx, raw, agent, project, kind, scope, &content, "", "provisional", 0.6, None,
+        &tx, raw, agent, project, kind, scope, &content, "", "provisional", 0.6, expires_at,
     )
     .map_err(|e| e.to_string())?;
     if let Some(v) = &vector {
@@ -101,6 +112,29 @@ pub fn tool_search(conn: &Connection, args: &Value) -> Result<String, String> {
     Ok(search::format_hits(&hits))
 }
 
+pub fn tool_vote(conn: &Connection, args: &Value) -> Result<String, String> {
+    let memory_id = args
+        .get("memory_id")
+        .and_then(|v| v.as_i64())
+        .ok_or("missing integer argument `memory_id`")?;
+    let agent = req_str(args, "agent")?;
+    let vote = match req_str(args, "vote")? {
+        "up" => 1,
+        "down" => -1,
+        other => return Err(format!("invalid vote `{other}`; expected up|down")),
+    };
+    let session = opt_str(args, "session").unwrap_or("");
+    let note = opt_str(args, "note").unwrap_or("");
+    let counts = db::cast_vote(conn, memory_id, agent, session, vote, note)?;
+    Ok(json!({
+        "memory_id": memory_id,
+        "upvotes": counts.up,
+        "downvotes": counts.down,
+        "usefulness": db::usefulness(counts.up, counts.down),
+    })
+    .to_string())
+}
+
 pub fn tool_get(conn: &Connection, args: &Value) -> Result<String, String> {
     let id = args
         .get("id")
@@ -127,6 +161,9 @@ pub fn tool_get(conn: &Connection, args: &Value) -> Result<String, String> {
         "expires_at": m.expires_at,
         "access_count": m.access_count,
         "last_access_at": m.last_access_at,
+        "upvotes": m.upvotes,
+        "downvotes": m.downvotes,
+        "last_confirmed_at": m.last_confirmed_at,
     })
     .to_string())
 }
@@ -149,6 +186,7 @@ pub fn tool_stats(conn: &Connection, _args: &Value) -> Result<String, String> {
         "canonical": s.canonical,
         "archived": s.archived,
         "agents": s.agents,
+        "votes": s.votes,
     })
     .to_string())
 }
@@ -217,6 +255,21 @@ fn tool_list() -> Value {
             }
         },
         {
+            "name": "vote",
+            "description": "Confirm a memory you actually used and verified (up), or flag one you found wrong or outdated (down), then write a correction memory for wrong ones. One vote per agent per session; an upvote resets the memory's expiry timer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "integer"},
+                    "agent": {"type": "string", "description": "Your agent name"},
+                    "vote": {"type": "string", "enum": ["up", "down"]},
+                    "session": {"type": "string", "description": "Session identifier; one vote per agent and session"},
+                    "note": {"type": "string", "description": "Optional short reason"}
+                },
+                "required": ["memory_id", "agent", "vote"]
+            }
+        },
+        {
             "name": "digest",
             "description": "Return this agent's curated memory digest (capped, cache-stable). Useful at the start of a session.",
             "inputSchema": {
@@ -257,6 +310,7 @@ fn call_tool(conn: &Connection, msg: &Value) -> Result<Value, (i32, String)> {
         "remember" => tool_remember(conn, &args),
         "search" => tool_search(conn, &args),
         "get" => tool_get(conn, &args),
+        "vote" => tool_vote(conn, &args),
         "digest" => tool_digest(conn, &args),
         "history" => tool_history(conn, &args),
         "stats" => tool_stats(conn, &args),

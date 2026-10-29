@@ -39,6 +39,7 @@ is disabled — both remain fully usable.
 | `remember` | append a raw memory; a searchable provisional record exists immediately |
 | `search` | hybrid search, scoped to what the agent may see |
 | `get` | full memory by id |
+| `vote` | confirm (`up`) or flag (`down`) a memory you actually used |
 | `digest` | the agent's curated ≤2200-char digest (tier-1 context) |
 | `history` | version history of one memory |
 | `stats` | store counts |
@@ -85,6 +86,28 @@ Three ranked signals fused with RRF (`k=60`):
 Visibility: an agent sees its own memories plus all `shared` ones. Archived memories are
 excluded. Returned hits bump `access_count`/`last_access_at`.
 
+### Feedback loop
+
+Memory is reinforced by real use, not by retrieval:
+
+- An agent that applies a memory and verifies the result votes it up (`vote` tool). One
+  vote per agent per session; a later vote replaces the earlier one.
+- An agent that finds a memory wrong votes it down and writes a `correction` memory.
+  The curator archives the superseded memory and sums its votes into the survivor.
+- A `remember` call whose content is byte-identical to an existing memory is treated as
+  validation: the duplicate is rejected and the existing memory is upvoted (the same
+  signal Copilot Memory calls "upvote instead of storing a duplicate").
+- Fused scores are multiplied by `1 + 0.3 × usefulness`, `usefulness =
+  (up − down) / (up + down + 2)`, clamped to 0.7–1.3. Votes nudge, never dominate.
+- Memories with ≥ 3 votes and a negative balance are hidden from retrieval; the curator
+  archives them.
+
+### Expiry
+
+New memories expire after `AMS_MEMORY_TTL_DAYS` (default 90) — except `procedure`
+memories, which never expire. Only an upvote resets the timer; retrieval does not. The
+curator archives expired memories each run (recoverable via `ams history`/`restore`).
+
 ### Memory tiers
 
 - **Provisional** — captured, searchable, not yet curated.
@@ -127,6 +150,7 @@ ams reembed                             rebuild vectors after a model change
 | `AMS_CURATE_BATCH` | `20` | max raw records per curation run |
 | `AMS_CURATE_INTERVAL_SECS` | `7200` | curation interval |
 | `AMS_CURATE_DISABLED` | unset | set to disable the background curator |
+| `AMS_MEMORY_TTL_DAYS` | `90` | expiry for new memories without reinforcement |
 | `AMS_MODEL_CACHE` | platform cache dir | embedding model cache |
 
 ## Limits and caveats
@@ -140,6 +164,10 @@ ams reembed                             rebuild vectors after a model change
   cleanup route.
 - `porter unicode61` stems English. Non-English memories and code identifiers are
   matched less well by FTS; the embedding side still works.
+- Vote counts are per session, so an agent cannot inflate one memory by re-voting inside
+  the same session; it can still vote once per session across many sessions. Votes from
+  the memory's author are counted — separate sessions of the same agent are the primary
+  reuse case, and the session key prevents stuffing.
 - Stored vectors are tied to the embedding model. Changing `MODEL_NAME` or bumping
   `TEXT_VERSION` in `src/embeddings.rs` requires `ams reembed`.
 - The curator requires network access to the Anthropic API. Everything else is local.

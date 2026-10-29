@@ -56,6 +56,7 @@ pub struct Report {
     pub archived: usize,
     pub promoted: usize,
     pub digests: usize,
+    pub expired: usize,
 }
 
 /// Run one curation pass. Returns `skipped` when another process holds the
@@ -80,10 +81,16 @@ pub fn run_once(conn: &Connection, cfg: &CuratorConfig) -> Result<Report, String
 }
 
 fn run_locked(conn: &Connection, cfg: &CuratorConfig) -> Result<Report, String> {
+    // Deterministic housekeeping first: memories whose reinforcement timer ran
+    // out are archived before the batch is read.
+    let expired = db::archive_expired(conn).map_err(|e| e.to_string())?;
     let pending = db::pending_raw(conn, cfg.batch).map_err(|e| e.to_string())?;
     if pending.is_empty() {
         db::set_consumer(conn, CURATOR, 0, db::now()).map_err(|e| e.to_string())?;
-        return Ok(Report::default());
+        return Ok(Report {
+            expired,
+            ..Default::default()
+        });
     }
 
     // Each raw record already has a provisional memory (searchable since the
@@ -130,6 +137,7 @@ fn run_locked(conn: &Connection, cfg: &CuratorConfig) -> Result<Report, String> 
     let max_raw_id = raw_ids.iter().copied().max().unwrap_or(0);
     let mut report = Report {
         batch: pending.len(),
+        expired,
         ..Default::default()
     };
     let mut reembed: Vec<(i64, String)> = Vec::new();
@@ -186,6 +194,10 @@ fn run_locked(conn: &Connection, cfg: &CuratorConfig) -> Result<Report, String> 
             "archive" => {
                 db::archive_memory(&tx, memory_id, op.superseded_by)
                     .map_err(|e| e.to_string())?;
+                // A superseded memory's confirmations belong to its survivor.
+                if let Some(survivor) = op.superseded_by {
+                    db::merge_votes(&tx, memory_id, survivor).map_err(|e| e.to_string())?;
+                }
                 touched.insert(memory_id);
                 report.archived += 1;
             }
@@ -254,7 +266,8 @@ You receive newly captured raw memories (each backed by an existing provisional 
 Rules:
 - Resolve every provisional memory in new_memories: keep it with an "update" op (improve wording if useful), or "archive" it because an existing memory covers it.
 - Merge duplicates: one memory per fact. Keep one record, archive the other(s) with superseded_by set to the kept id.
-- Human corrections (kind "correction") are authoritative. They supersede conflicting older memories: archive the conflicting one with superseded_by pointing at the correction.
+- Human corrections (kind "correction") are authoritative. They supersede conflicting older memories: archive the conflicting one with superseded_by pointing at the correction. A correction always wins over vote counts.
+- Vote counts (upvotes/downvotes) mean real reuse: an upvote is an agent that validated the memory; a downvote means it was found wrong. Prefer keeping well-reinforced memories when merging; votes of archived memories are summed into their survivor automatically.
 - Set scope "shared" only for project-independent facts (user preferences, agent behavior, tooling) useful to every agent. Otherwise keep "own".
 - If the same troubleshoot fix appears a second time, convert the kept memory to kind "procedure".
 - Ephemeral content (temporary workarounds, one-off state) gets expires_at set to a unix timestamp about 30 days ahead. Durable facts get expires_at null, which clears any existing expiry.
@@ -301,6 +314,9 @@ fn build_prompt(
                 "kind": m.kind,
                 "scope": m.scope,
                 "status": m.status,
+                "upvotes": m.upvotes,
+                "downvotes": m.downvotes,
+                "expires_at": m.expires_at,
                 "content": db::truncate_chars(m.content.trim(), 600),
             })
         })
@@ -448,10 +464,10 @@ pub fn spawn(db_path: PathBuf, cfg: CuratorConfig) {
             match run_once(&conn, &cfg) {
                 Ok(r) => {
                     failures = 0;
-                    if r.batch > 0 {
+                    if r.batch > 0 || r.expired > 0 {
                         eprintln!(
-                            "ams: curated {} record(s): {} updated, {} archived, {} promoted, {} digest(s)",
-                            r.batch, r.updated, r.archived, r.promoted, r.digests
+                            "ams: curated {} record(s): {} updated, {} archived, {} promoted, {} digest(s), {} expired",
+                            r.batch, r.updated, r.archived, r.promoted, r.digests, r.expired
                         );
                     }
                 }

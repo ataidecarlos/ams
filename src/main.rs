@@ -51,6 +51,19 @@ enum Sub {
         #[arg(long)]
         agent: String,
     },
+    /// Confirm (up) or flag (down) a memory you used
+    Vote {
+        memory_id: i64,
+        #[arg(long)]
+        agent: String,
+        /// up | down
+        #[arg(long)]
+        vote: String,
+        #[arg(long, default_value = "")]
+        session: String,
+        #[arg(long, default_value = "")]
+        note: String,
+    },
     /// Run one curation pass (needs AMS_ANTHROPIC_API_KEY)
     Curate,
     /// Memory store counts
@@ -132,6 +145,27 @@ fn run(conn: &Connection, cmd: Sub) -> Result<(), String> {
             Some(d) if !d.trim().is_empty() => println!("{d}"),
             _ => println!("(no digest yet for `{agent}`)"),
         },
+        Sub::Vote {
+            memory_id,
+            agent,
+            vote,
+            session,
+            note,
+        } => {
+            let v = match vote.as_str() {
+                "up" => 1,
+                "down" => -1,
+                other => return Err(format!("invalid vote `{other}`; expected up|down")),
+            };
+            let c = db::cast_vote(conn, memory_id, &agent, &session, v, &note)?;
+            println!(
+                "memory {}: up {} down {} usefulness {:.2}",
+                memory_id,
+                c.up,
+                c.down,
+                db::usefulness(c.up, c.down)
+            );
+        }
         Sub::Curate => {
             let cfg = curator::CuratorConfig::from_env()
                 .ok_or("AMS_ANTHROPIC_API_KEY is not set; curation needs an API key")?;
@@ -142,8 +176,8 @@ fn run(conn: &Connection, cmd: Sub) -> Result<(), String> {
                 println!("nothing to curate");
             } else {
                 println!(
-                    "curated {} record(s): {} updated, {} archived, {} promoted, {} digest(s)",
-                    r.batch, r.updated, r.archived, r.promoted, r.digests
+                    "curated {} record(s): {} updated, {} archived, {} promoted, {} digest(s), {} expired",
+                    r.batch, r.updated, r.archived, r.promoted, r.digests, r.expired
                 );
             }
         }
@@ -155,6 +189,7 @@ fn run(conn: &Connection, cmd: Sub) -> Result<(), String> {
                 s.memories, s.provisional, s.canonical, s.archived
             );
             println!("agents: {}", s.agents);
+            println!("votes: {}", s.votes);
         }
         Sub::History { memory_id } => {
             let versions = db::versions(conn, memory_id).map_err(|e| e.to_string())?;

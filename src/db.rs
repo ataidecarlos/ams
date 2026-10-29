@@ -130,6 +130,26 @@ CREATE TABLE meta (
   value TEXT NOT NULL);
 ";
 
+// Feedback loop: agents upvote memories they validated and downvote ones they
+// found wrong or outdated. Retrieval never votes — only explicit use does.
+const SCHEMA_V2: &str = "
+ALTER TABLE memories ADD COLUMN upvotes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE memories ADD COLUMN downvotes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE memories ADD COLUMN last_confirmed_at INTEGER;
+
+CREATE TABLE IF NOT EXISTS memory_votes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  memory_id INTEGER NOT NULL REFERENCES memories(id),
+  agent TEXT NOT NULL,
+  session TEXT NOT NULL DEFAULT '',
+  vote INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  at INTEGER NOT NULL,
+  UNIQUE(memory_id, agent, session));
+
+CREATE INDEX IF NOT EXISTS idx_votes_memory ON memory_votes(memory_id);
+";
+
 pub fn config_db_path() -> PathBuf {
     if let Ok(p) = std::env::var("AMS_DB")
         && !p.is_empty()
@@ -153,7 +173,7 @@ pub fn open_db_at(path: &Path) -> rusqlite::Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.busy_timeout(std::time::Duration::from_millis(5000))?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let mut version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version == 0 {
         conn.execute_batch(SCHEMA_V1)?;
         conn.execute(
@@ -161,19 +181,27 @@ pub fn open_db_at(path: &Path) -> rusqlite::Result<Connection> {
             params![crate::embeddings::model_id()],
         )?;
         conn.pragma_update(None, "user_version", 1)?;
-    } else {
-        // A model or text-recipe swap makes every stored vector a different
-        // vector space. Warn once; `ams reembed` rebuilds them.
-        let stored: Option<String> = conn
-            .query_row("SELECT value FROM meta WHERE key = 'vector_model'", [], |r| r.get(0))
-            .optional()?;
-        if stored.as_deref() != Some(crate::embeddings::model_id().as_str()) {
-            eprintln!(
-                "ams: stored vectors use `{}`, current model is `{}`; run `ams reembed`",
-                stored.unwrap_or_default(),
-                crate::embeddings::model_id()
-            );
-        }
+        version = 1;
+    }
+    if version < 2 {
+        conn.execute_batch(SCHEMA_V2)?;
+        conn.pragma_update(None, "user_version", 2)?;
+    }
+    // A model or text-recipe swap makes every stored vector a different
+    // vector space. Warn once; `ams reembed` rebuilds them.
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'vector_model'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if stored.as_deref() != Some(crate::embeddings::model_id().as_str()) {
+        eprintln!(
+            "ams: stored vectors use `{}`, current model is `{}`; run `ams reembed`",
+            stored.unwrap_or_default(),
+            crate::embeddings::model_id()
+        );
     }
     Ok(conn)
 }
@@ -207,11 +235,15 @@ pub struct Memory {
     pub expires_at: Option<i64>,
     pub access_count: i64,
     pub last_access_at: Option<i64>,
+    pub upvotes: i64,
+    pub downvotes: i64,
+    pub last_confirmed_at: Option<i64>,
 }
 
 const MEMORY_COLS: &str = "id, agent, project, kind, scope, content, tags, status, confidence, \
                            raw_id, supersedes_id, superseded_by, version, created_at, updated_at, \
-                           expires_at, access_count, last_access_at";
+                           expires_at, access_count, last_access_at, upvotes, downvotes, \
+                           last_confirmed_at";
 
 fn memory_from_row(r: &Row) -> rusqlite::Result<Memory> {
     Ok(Memory {
@@ -233,6 +265,9 @@ fn memory_from_row(r: &Row) -> rusqlite::Result<Memory> {
         expires_at: r.get(15)?,
         access_count: r.get(16)?,
         last_access_at: r.get(17)?,
+        upvotes: r.get(18)?,
+        downvotes: r.get(19)?,
+        last_confirmed_at: r.get(20)?,
     })
 }
 
@@ -332,6 +367,133 @@ pub fn archive_memory(
     Ok(())
 }
 
+// ---------------------------------------------------------------- votes
+
+/// Fresh memories expire without reinforcement; an upvote resets the timer.
+/// `AMS_MEMORY_TTL_DAYS` (default 90) applies to every kind except procedures.
+pub fn ttl_secs() -> i64 {
+    let days: i64 = std::env::var("AMS_MEMORY_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|d| *d > 0)
+        .unwrap_or(90);
+    days * 86_400
+}
+
+/// Laplace-smoothed vote ratio in (-1, 1). Zero votes scores 0 (neutral).
+pub fn usefulness(up: i64, down: i64) -> f32 {
+    (up - down) as f32 / (up + down + 2) as f32
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VoteCounts {
+    pub up: i64,
+    pub down: i64,
+}
+
+/// One vote per (memory, agent, session); a later vote replaces the earlier
+/// one. An upvote confirms the memory and resets its expiry timer.
+pub fn cast_vote(
+    conn: &Connection,
+    memory_id: i64,
+    agent: &str,
+    session: &str,
+    vote: i64,
+    note: &str,
+) -> Result<VoteCounts, String> {
+    let vote = if vote >= 0 { 1 } else { -1 };
+    let note = truncate_chars(note, 500);
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let status: Option<String> = tx
+        .query_row(
+            "SELECT status FROM memories WHERE id = ?1",
+            params![memory_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(status) = status else {
+        return Err(format!("memory {memory_id} not found"));
+    };
+    if status == "archived" {
+        return Err(format!(
+            "memory {memory_id} is archived; write a correction memory instead"
+        ));
+    }
+    tx.execute(
+        "INSERT INTO memory_votes (memory_id, agent, session, vote, note, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(memory_id, agent, session)
+         DO UPDATE SET vote = excluded.vote, note = excluded.note, at = excluded.at",
+        params![memory_id, agent, session, vote, note, now()],
+    )
+    .map_err(|e| e.to_string())?;
+    let counts = vote_counts(&tx, memory_id).map_err(|e| e.to_string())?;
+    if vote > 0 {
+        // Procedures never expire; everything else gets a fresh TTL.
+        tx.execute(
+            "UPDATE memories SET upvotes = ?2, downvotes = ?3, last_confirmed_at = ?4,
+               expires_at = CASE WHEN kind = 'procedure' THEN NULL ELSE ?5 END
+             WHERE id = ?1",
+            params![memory_id, counts.up, counts.down, now(), now() + ttl_secs()],
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        // A downvote changes the score but deliberately does not extend life.
+        tx.execute(
+            "UPDATE memories SET upvotes = ?2, downvotes = ?3 WHERE id = ?1",
+            params![memory_id, counts.up, counts.down],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(counts)
+}
+
+pub fn vote_counts(conn: &Connection, memory_id: i64) -> rusqlite::Result<VoteCounts> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(vote = 1), 0), COALESCE(SUM(vote = -1), 0)
+         FROM memory_votes WHERE memory_id = ?1",
+        params![memory_id],
+        |r| {
+            Ok(VoteCounts {
+                up: r.get(0)?,
+                down: r.get(1)?,
+            })
+        },
+    )
+}
+
+/// Transfer votes when one memory supersedes another. Colliding (agent,
+/// session) rows are dropped in favour of the survivor's own vote; counters
+/// on the survivor are then recomputed from the merged rows.
+pub fn merge_votes(conn: &Connection, from_id: i64, to_id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_votes (memory_id, agent, session, vote, note, at)
+         SELECT ?2, agent, session, vote, note, at FROM memory_votes WHERE memory_id = ?1",
+        params![from_id, to_id],
+    )?;
+    conn.execute(
+        "DELETE FROM memory_votes WHERE memory_id = ?1",
+        params![from_id],
+    )?;
+    let c = vote_counts(conn, to_id)?;
+    conn.execute(
+        "UPDATE memories SET upvotes = ?2, downvotes = ?3 WHERE id = ?1",
+        params![to_id, c.up, c.down],
+    )?;
+    Ok(())
+}
+
+/// Archive memories whose reinforcement timer ran out.
+pub fn archive_expired(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE memories SET status = 'archived', updated_at = ?1
+         WHERE status != 'archived' AND expires_at IS NOT NULL AND expires_at <= ?1",
+        params![now()],
+    )
+}
+
 pub fn get_memory(conn: &Connection, id: i64) -> rusqlite::Result<Option<Memory>> {
     conn.query_row(
         &format!("SELECT {MEMORY_COLS} FROM memories WHERE id = ?1"),
@@ -396,10 +558,12 @@ pub fn knn(
          WHERE m.status != 'archived'
            AND (m.scope = 'shared' OR m.agent = ?3)
            AND (?4 IS NULL OR m.project = ?4)
+           AND (m.expires_at IS NULL OR m.expires_at > ?5)
+           AND NOT (m.downvotes >= 3 AND (m.upvotes - m.downvotes) < 0)
          ORDER BY v.distance",
     )?;
     let rows = stmt.query_map(
-        params![crate::embeddings::to_blob(query), k, agent, project],
+        params![crate::embeddings::to_blob(query), k, agent, project, now()],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)? as f32)),
     )?;
     rows.collect()
@@ -423,10 +587,12 @@ pub fn fts_search(
            AND m.status != 'archived'
            AND (m.scope = 'shared' OR m.agent = ?2)
            AND (?3 IS NULL OR m.project = ?3)
+           AND (m.expires_at IS NULL OR m.expires_at > ?5)
+           AND NOT (m.downvotes >= 3 AND (m.upvotes - m.downvotes) < 0)
          ORDER BY bm25(memories_fts, 1.0, 4.0)
          LIMIT ?4",
     )?;
-    let rows = stmt.query_map(params![match_expr, agent, project, limit], |r| {
+    let rows = stmt.query_map(params![match_expr, agent, project, limit, now()], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
     })?;
     rows.collect()
@@ -640,6 +806,7 @@ pub struct Stats {
     pub canonical: i64,
     pub archived: i64,
     pub agents: i64,
+    pub votes: i64,
 }
 
 pub fn stats(conn: &Connection) -> rusqlite::Result<Stats> {
@@ -652,6 +819,7 @@ pub fn stats(conn: &Connection) -> rusqlite::Result<Stats> {
         canonical: q("SELECT COUNT(*) FROM memories WHERE status = 'canonical'")?,
         archived: q("SELECT COUNT(*) FROM memories WHERE status = 'archived'")?,
         agents: q("SELECT COUNT(DISTINCT agent) FROM memories")?,
+        votes: q("SELECT COUNT(*) FROM memory_votes")?,
     })
 }
 
@@ -697,7 +865,7 @@ mod tests {
     fn schema_initializes() {
         let conn = temp_db("schema");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
         // sqlite-vec is loaded and the vec0 table exists
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM memories_vec", [], |r| r.get(0))
@@ -795,5 +963,119 @@ mod tests {
         assert_eq!(p.iter().map(|r| r.id).collect::<Vec<_>>(), vec![a, b]);
         mark_raw_consumed(&conn, &[a]).unwrap();
         assert_eq!(pending_raw(&conn, 10).unwrap().len(), 1);
+    }
+
+    fn mem(conn: &Connection, agent: &str, content: &str, expires_at: Option<i64>) -> i64 {
+        let raw = insert_raw(conn, agent, "", "fact", "own", content, "").unwrap();
+        insert_memory(conn, raw, agent, "", "fact", "own", content, "", "canonical", 0.6, expires_at)
+            .unwrap()
+    }
+
+    #[test]
+    fn vote_is_one_per_agent_session_and_refreshes_expiry() {
+        let conn = temp_db("votes");
+        let id = mem(&conn, "a", "kubernetes rollback", Some(now() - 10));
+
+        // Expired memory is invisible until an upvote revives it.
+        assert!(fts_search(&conn, "\"kubernetes\"", "a", None, 10).unwrap().is_empty());
+
+        let c = cast_vote(&conn, id, "a", "s1", 1, "").unwrap();
+        assert_eq!((c.up, c.down), (1, 0));
+        let m = get_memory(&conn, id).unwrap().unwrap();
+        assert!(m.expires_at.unwrap() > now());
+        assert!(m.last_confirmed_at.is_some());
+        assert_eq!(fts_search(&conn, "\"kubernetes\"", "a", None, 10).unwrap().len(), 1);
+
+        // Re-voting in the same session replaces the vote.
+        let c = cast_vote(&conn, id, "a", "s1", -1, "").unwrap();
+        assert_eq!((c.up, c.down), (0, 1));
+
+        // A different session or agent adds a vote.
+        let c = cast_vote(&conn, id, "a", "s2", 1, "").unwrap();
+        assert_eq!((c.up, c.down), (1, 1));
+        let c = cast_vote(&conn, id, "b", "s9", 1, "").unwrap();
+        assert_eq!((c.up, c.down), (2, 1));
+
+        // Downvotes never extend the timer.
+        let before = get_memory(&conn, id).unwrap().unwrap().expires_at;
+        cast_vote(&conn, id, "c", "s3", -1, "").unwrap();
+        assert_eq!(get_memory(&conn, id).unwrap().unwrap().expires_at, before);
+    }
+
+    #[test]
+    fn archived_memory_rejects_votes() {
+        let conn = temp_db("vote_archived");
+        let id = mem(&conn, "a", "old fact", None);
+        archive_memory(&conn, id, None).unwrap();
+        assert!(cast_vote(&conn, id, "a", "s1", 1, "").is_err());
+    }
+
+    #[test]
+    fn three_downvotes_hide_a_memory() {
+        let conn = temp_db("vote_hide");
+        let id = mem(&conn, "a", "wrong rollback advice", None);
+        for (i, agent) in ["a", "b", "c"].iter().enumerate() {
+            cast_vote(&conn, id, agent, &format!("s{i}"), -1, "").unwrap();
+        }
+        assert!(fts_search(&conn, "\"rollback\"", "a", None, 10).unwrap().is_empty());
+        assert!(get_memory(&conn, id).unwrap().is_some());
+    }
+
+    #[test]
+    fn merge_votes_moves_counts_to_survivor() {
+        let conn = temp_db("vote_merge");
+        let old = mem(&conn, "a", "old duplicate", None);
+        let new = mem(&conn, "a", "merged fact", None);
+        cast_vote(&conn, old, "a", "s1", 1, "").unwrap();
+        cast_vote(&conn, old, "b", "s2", 1, "").unwrap();
+        cast_vote(&conn, new, "c", "s3", 1, "").unwrap();
+        merge_votes(&conn, old, new).unwrap();
+        let m = get_memory(&conn, new).unwrap().unwrap();
+        assert_eq!((m.upvotes, m.downvotes), (3, 0));
+        assert_eq!(vote_counts(&conn, old).unwrap().up, 0);
+    }
+
+    #[test]
+    fn expired_sweep_archives_only_expired() {
+        let conn = temp_db("expiry");
+        let old = mem(&conn, "a", "stale", Some(now() - 1));
+        let fresh = mem(&conn, "a", "fresh", Some(now() + 1000));
+        let eternal = mem(&conn, "a", "eternal", None);
+        assert_eq!(archive_expired(&conn).unwrap(), 1);
+        assert_eq!(get_memory(&conn, old).unwrap().unwrap().status, "archived");
+        assert_eq!(get_memory(&conn, fresh).unwrap().unwrap().status, "canonical");
+        assert_eq!(get_memory(&conn, eternal).unwrap().unwrap().status, "canonical");
+    }
+
+    #[test]
+    fn usefulness_is_neutral_at_zero_votes() {
+        assert_eq!(usefulness(0, 0), 0.0);
+        assert!(usefulness(3, 0) > 0.0);
+        assert!(usefulness(0, 3) < 0.0);
+    }
+
+    #[test]
+    fn v1_database_upgrades_to_v2() {
+        let dir = std::env::temp_dir().join(format!("ams_test_upgrade_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('vector_model', ?1)",
+                params![crate::embeddings::model_id()],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let conn = open_db_at(&path).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 2);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_votes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }

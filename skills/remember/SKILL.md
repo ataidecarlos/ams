@@ -97,6 +97,19 @@ remember(
 )
 ```
 
+## After a memory helped you
+
+Memory only stays useful if agents report back. Two signals:
+
+1. **It worked.** Once you actually applied a memory and verified the result, call the
+   MCP tool `vote` with `vote: "up"`. This confirms the memory and resets its expiry
+   timer. Passing a `session` id limits you to one vote per memory per session.
+2. **It was wrong or outdated.** Call `vote` with `vote: "down"`, then write a
+   `correction` memory that supersedes it. Never downvote a memory you did not use.
+
+Do not vote just because a search returned something, or because you wrote it. Use is
+the signal, retrieval is not.
+
 ## Reading memory back
 
 - `search` — hybrid lexical + semantic search; use it when a task resembles something you

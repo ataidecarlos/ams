@@ -46,6 +46,13 @@ fn semantic_gate(scores: &mut Vec<(i64, f32)>) {
     scores.retain(|(_, s)| *s >= cut);
 }
 
+/// Vote signal applied to the fused score. Bounded (0.7–1.3) so evidence
+/// nudges the fusion order without letting one upvote dominate it.
+fn vote_multiplier(up: i64, down: i64) -> f64 {
+    let u = db::usefulness(up, down) as f64;
+    (1.0 + 0.3 * u).clamp(0.7, 1.3)
+}
+
 /// Reciprocal Rank Fusion: score = Σ 1/(k + rank). `k` = 60 is the constant
 /// from the RRF paper.
 pub fn rrf_merge(lists: &[Vec<i64>], k: f64, limit: usize) -> Vec<(i64, f64)> {
@@ -157,6 +164,7 @@ pub fn search(
             Some(s) => s.trim().to_string(),
             None => first_line(&memory.content),
         };
+        let score = score * vote_multiplier(memory.upvotes, memory.downvotes);
         hits.push(Hit {
             memory,
             snippet,
@@ -164,6 +172,8 @@ pub fn search(
             score,
         });
     }
+    // Votes can reorder memories that fused close together.
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     let ids: Vec<i64> = hits.iter().map(|h| h.memory.id).collect();
     let _ = db::bump_access(conn, &ids);
@@ -194,10 +204,15 @@ pub fn format_hits(hits: &[Hit]) -> String {
         } else {
             ""
         };
+        let vote_tag = if m.upvotes > 0 || m.downvotes > 0 {
+            format!(" votes ↑{}↓{}", m.upvotes, m.downvotes)
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "[{}] ({}, {}{}) {}{} rrf={:.4}",
-            m.id, m.kind, project, scope, m.agent, tag, h.score
+            "[{}] ({}, {}{}) {}{}{} rrf={:.4}",
+            m.id, m.kind, project, scope, m.agent, tag, vote_tag, h.score
         );
         let _ = writeln!(out, "    {}", h.snippet);
     }
@@ -225,6 +240,15 @@ mod tests {
         let merged = rrf_merge(&[lexical, semantic], 60.0, 10);
         assert_eq!(merged[0].0, 3);
         assert_eq!(merged.len(), 4);
+    }
+
+    #[test]
+    fn votes_adjust_but_do_not_dominate() {
+        assert_eq!(vote_multiplier(0, 0), 1.0);
+        assert!(vote_multiplier(3, 0) > 1.0);
+        assert!(vote_multiplier(0, 3) < 1.0);
+        assert!(vote_multiplier(100, 0) <= 1.3);
+        assert!(vote_multiplier(0, 100) >= 0.7);
     }
 
     #[test]

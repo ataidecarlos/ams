@@ -22,7 +22,52 @@ fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// Session identity for one MCP process. Hosts rarely hand agents a session
+/// id, so without this every vote from an agent would collide on "" and the
+/// reuse signal would saturate at one upvote forever.
+static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn default_session() -> &'static str {
+    SESSION.get_or_init(db::new_session_id)
+}
+
+fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if err.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
 // ---------------------------------------------------------------- tools
+
+/// A write that duplicates an existing memory: keep the raw record for the
+/// audit trail and treat the rediscovery as validation, the same signal
+/// Copilot Memory calls "upvote instead of storing a duplicate".
+fn record_duplicate(
+    conn: &Connection,
+    existing_id: i64,
+    agent: &str,
+    project: &str,
+    kind: &str,
+    scope: &str,
+    content: &str,
+    session: &str,
+) -> Result<String, String> {
+    let raw = db::insert_raw(conn, agent, project, kind, scope, content, session)
+        .map_err(|e| e.to_string())?;
+    db::mark_raw_consumed(conn, &[raw]).map_err(|e| e.to_string())?;
+    let counts = db::cast_vote(conn, existing_id, agent, session, 1, "duplicate write").ok();
+    Ok(json!({
+        "memory_id": existing_id,
+        "duplicate": true,
+        "status": "duplicate",
+        "upvoted": counts.is_some(),
+        "upvotes": counts.map(|c| c.up),
+        "message": "an identical memory already exists; it was confirmed instead"
+    })
+    .to_string())
+}
 
 pub fn tool_remember(conn: &Connection, args: &Value) -> Result<String, String> {
     let agent = req_str(args, "agent")?;
@@ -33,33 +78,21 @@ pub fn tool_remember(conn: &Connection, args: &Value) -> Result<String, String> 
             "invalid kind `{kind}`; expected troubleshoot|correction|fact|procedure"
         ));
     }
-    let scope = opt_str(args, "scope").unwrap_or("own");
-    if !curator::is_scope(scope) {
-        return Err(format!("invalid scope `{scope}`; expected own|shared"));
-    }
+    let requested_shared = match opt_str(args, "scope") {
+        Some("shared") => true,
+        Some("own") | None => false,
+        Some(other) => return Err(format!("invalid scope `{other}`; expected own|shared")),
+    };
+    // Agents may request shared, but promotion stays a curation decision so one
+    // misconfigured agent cannot plant facts every agent sees.
+    let scope = "own";
     let session = opt_str(args, "source_session").unwrap_or("");
     let content = req_str(args, "content")?;
     let content = db::truncate_chars(content, MAX_CONTENT_CHARS);
+    let hash = db::content_hash(&content);
 
-    // Exact duplicate: keep the raw record for the audit trail, and treat the
-    // rediscovery as validation — same signal Copilot Memory calls upvoting
-    // instead of storing a duplicate.
-    if let Some(id) = db::find_duplicate(conn, agent, &db::content_hash(&content))
-        .map_err(|e| e.to_string())?
-    {
-        let raw = db::insert_raw(conn, agent, project, kind, scope, &content, session)
-            .map_err(|e| e.to_string())?;
-        db::mark_raw_consumed(conn, &[raw]).map_err(|e| e.to_string())?;
-        let counts = db::cast_vote(conn, id, agent, session, 1, "duplicate write").ok();
-        return Ok(json!({
-            "memory_id": id,
-            "duplicate": true,
-            "status": "duplicate",
-            "upvoted": counts.is_some(),
-            "upvotes": counts.map(|c| c.up),
-            "message": "an identical memory already exists; it was confirmed instead"
-        })
-        .to_string());
+    if let Some(id) = db::find_duplicate(conn, agent, &hash).map_err(|e| e.to_string())? {
+        return record_duplicate(conn, id, agent, project, kind, scope, &content, session);
     }
 
     // Embedding runs outside the write transaction: ONNX is slow, and the
@@ -77,20 +110,36 @@ pub fn tool_remember(conn: &Connection, args: &Value) -> Result<String, String> 
     } else {
         Some(db::now() + db::ttl_secs())
     };
-    let id = db::insert_memory(
+    // The unique (agent, content_hash) index catches duplicates that slipped
+    // past the pre-check under concurrency.
+    let id = match db::insert_memory(
         &tx, raw, agent, project, kind, scope, &content, "", "provisional", 0.6, expires_at,
-    )
-    .map_err(|e| e.to_string())?;
-    if let Some(v) = &vector {
-        db::set_vector(&tx, id, v).map_err(|e| e.to_string())?;
-    }
-    tx.commit().map_err(|e| e.to_string())?;
+    ) {
+        Ok(id) => {
+            if let Some(v) = &vector {
+                db::set_vector(&tx, id, v).map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            id
+        }
+        Err(e) if is_unique_violation(&e) => {
+            drop(tx); // rolls back
+            let Some(existing) = db::find_duplicate(conn, agent, &hash).map_err(|e| e.to_string())?
+            else {
+                return Err(e.to_string());
+            };
+            return record_duplicate(conn, existing, agent, project, kind, scope, &content, session);
+        }
+        Err(e) => return Err(e.to_string()),
+    };
 
     Ok(json!({
         "memory_id": id,
         "duplicate": false,
         "status": "provisional",
         "embedded": vector.is_some(),
+        "scope": scope,
+        "note": requested_shared.then_some("requested shared is stored as own; curation decides promotion"),
         "message": "stored; visible to search immediately"
     })
     .to_string())
@@ -123,9 +172,11 @@ pub fn tool_vote(conn: &Connection, args: &Value) -> Result<String, String> {
         "down" => -1,
         other => return Err(format!("invalid vote `{other}`; expected up|down")),
     };
-    let session = opt_str(args, "session").unwrap_or("");
+    let session = opt_str(args, "session")
+        .map(str::to_string)
+        .unwrap_or_else(|| default_session().to_string());
     let note = opt_str(args, "note").unwrap_or("");
-    let counts = db::cast_vote(conn, memory_id, agent, session, vote, note)?;
+    let counts = db::cast_vote(conn, memory_id, agent, &session, vote, note)?;
     Ok(json!({
         "memory_id": memory_id,
         "upvotes": counts.up,
@@ -170,9 +221,23 @@ pub fn tool_get(conn: &Connection, args: &Value) -> Result<String, String> {
 
 pub fn tool_digest(conn: &Connection, args: &Value) -> Result<String, String> {
     let agent = req_str(args, "agent")?;
-    match db::get_digest(conn, agent).map_err(|e| e.to_string())? {
-        Some(d) if !d.trim().is_empty() => Ok(d),
-        _ => Ok(format!("(no digest yet for `{agent}`)")),
+    match opt_str(args, "project") {
+        Some(project) => match db::get_digest(conn, agent, project).map_err(|e| e.to_string())? {
+            Some(d) if !d.trim().is_empty() => Ok(d),
+            _ => Ok(format!("(no digest yet for `{agent}` in `{project}`)")),
+        },
+        None => {
+            let rows = db::digests_for_agent(conn, agent).map_err(|e| e.to_string())?;
+            if rows.is_empty() {
+                return Ok(format!("(no digest yet for `{agent}`)"));
+            }
+            let mut out = String::new();
+            for (project, content) in rows {
+                let name = if project.is_empty() { "(no project)" } else { &project };
+                out.push_str(&format!("## {name}\n{content}\n\n"));
+            }
+            Ok(out.trim_end().to_string())
+        }
     }
 }
 
@@ -225,7 +290,7 @@ fn tool_list() -> Value {
                     "project": {"type": "string", "description": "Repository or project name"},
                     "kind": {"type": "string", "enum": ["troubleshoot", "correction", "fact", "procedure"]},
                     "content": {"type": "string", "description": "Max ~2000 chars. troubleshoot: symptom, cause, fix, verification. correction: what was wrong, what is correct, quote the human verbatim."},
-                    "scope": {"type": "string", "enum": ["own", "shared"], "default": "own", "description": "own = visible to this agent; shared = visible to all agents. Curation may promote facts to shared."},
+                    "scope": {"type": "string", "enum": ["own", "shared"], "default": "own", "description": "Stored as own; curation decides promotion to shared."},
                     "source_session": {"type": "string", "description": "Optional session identifier for provenance"}
                 },
                 "required": ["agent", "project", "kind", "content"]
@@ -263,7 +328,7 @@ fn tool_list() -> Value {
                     "memory_id": {"type": "integer"},
                     "agent": {"type": "string", "description": "Your agent name"},
                     "vote": {"type": "string", "enum": ["up", "down"]},
-                    "session": {"type": "string", "description": "Session identifier; one vote per agent and session"},
+                    "session": {"type": "string", "description": "Session identifier; defaults to this MCP process. One vote per agent and session"},
                     "note": {"type": "string", "description": "Optional short reason"}
                 },
                 "required": ["memory_id", "agent", "vote"]
@@ -271,10 +336,13 @@ fn tool_list() -> Value {
         },
         {
             "name": "digest",
-            "description": "Return this agent's curated memory digest (capped, cache-stable). Useful at the start of a session.",
+            "description": "Return the curated memory digest: project-specific when `project` is given, otherwise every project digest for this agent. Load it at the start of a session.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"agent": {"type": "string"}},
+                "properties": {
+                    "agent": {"type": "string"},
+                    "project": {"type": "string", "description": "Optional project name"}
+                },
                 "required": ["agent"]
             }
         },
@@ -337,7 +405,8 @@ fn handle(conn: &Connection, msg: &Value) -> Option<Value> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("2025-06-18"),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "ams", "version": env!("CARGO_PKG_VERSION")}
+            "serverInfo": {"name": "ams", "version": env!("CARGO_PKG_VERSION")},
+            "instructions": "AMS is a shared memory for AI agents. At the start of a session, call `digest` with your agent name and project to load what is already known. Before troubleshooting a familiar-sounding problem, call `search`. After a fix that came from a memory actually works, vote it up; if a memory was wrong or outdated, vote it down and write a correction. Call `remember` after troubleshooting an unexpected behavior to a working fix, or when a human corrects your behavior."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tool_list()})),

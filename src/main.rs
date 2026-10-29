@@ -50,6 +50,9 @@ enum Sub {
     Digest {
         #[arg(long)]
         agent: String,
+        /// Project-specific digest (omitted: all projects)
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Confirm (up) or flag (down) a memory you used
     Vote {
@@ -141,9 +144,21 @@ fn run(conn: &Connection, cmd: Sub) -> Result<(), String> {
                 print!("{}", search::format_hits(&hits));
             }
         }
-        Sub::Digest { agent } => match db::get_digest(conn, &agent).map_err(|e| e.to_string())? {
-            Some(d) if !d.trim().is_empty() => println!("{d}"),
-            _ => println!("(no digest yet for `{agent}`)"),
+        Sub::Digest { agent, project } => match project {
+            Some(p) => match db::get_digest(conn, &agent, &p).map_err(|e| e.to_string())? {
+                Some(d) if !d.trim().is_empty() => println!("{d}"),
+                _ => println!("(no digest yet for `{agent}` in `{p}`)"),
+            },
+            None => {
+                let rows = db::digests_for_agent(conn, &agent).map_err(|e| e.to_string())?;
+                if rows.is_empty() {
+                    println!("(no digest yet for `{agent}`)");
+                }
+                for (p, content) in rows {
+                    let name = if p.is_empty() { "(no project)" } else { &p };
+                    println!("## {name}\n{content}\n");
+                }
+            }
         },
         Sub::Vote {
             memory_id,
@@ -157,8 +172,12 @@ fn run(conn: &Connection, cmd: Sub) -> Result<(), String> {
                 "down" => -1,
                 other => return Err(format!("invalid vote `{other}`; expected up|down")),
             };
-            let c = db::cast_vote(conn, memory_id, &agent, &session, v, &note)?;
-            println!(
+            let session = if session.is_empty() {
+                db::new_session_id()
+            } else {
+                session
+            };
+            let c = db::cast_vote(conn, memory_id, &agent, &session, v, &note)?;            println!(
                 "memory {}: up {} down {} usefulness {:.2}",
                 memory_id,
                 c.up,

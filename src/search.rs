@@ -86,6 +86,20 @@ pub fn search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<Hit>, String> {
+    let qv = embeddings::embed_query(query);
+    search_with_vector(conn, agent, project, query, limit, qv)
+}
+
+/// Same as [`search`] with an explicit query vector (or `None` for
+/// lexical-only). Split out so tests never load the embedding model.
+pub fn search_with_vector(
+    conn: &Connection,
+    agent: &str,
+    project: Option<&str>,
+    query: &str,
+    limit: usize,
+    query_vector: Option<Vec<f32>>,
+) -> Result<Vec<Hit>, String> {
     let limit = limit.max(1);
     let pool = (limit * 4).max(20);
 
@@ -104,7 +118,7 @@ pub fn search(
     }
 
     // Signal 2: semantic KNN. Absent model => silently skip; FTS still works.
-    let mut semantic: Vec<(i64, f32)> = match embeddings::embed_query(query) {
+    let mut semantic: Vec<(i64, f32)> = match query_vector {
         Some(qv) => {
             let k = (pool * 2).max(40) as i64;
             db::knn(conn, &qv, agent, project, k)
@@ -151,7 +165,9 @@ pub fn search(
         return Ok(Vec::new());
     }
 
-    let merged = rrf_merge(&lists, 60.0, limit);
+    // Over-fetch before the vote multiplier so a strongly reinforced memory
+    // just below the cutoff can still surface.
+    let merged = rrf_merge(&lists, 60.0, limit.saturating_mul(2).max(limit + 1));
     let snippets: HashMap<i64, String> = lexical.into_iter().collect();
 
     let mut hits = Vec::with_capacity(merged.len());
@@ -174,6 +190,7 @@ pub fn search(
     }
     // Votes can reorder memories that fused close together.
     hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(limit);
 
     let ids: Vec<i64> = hits.iter().map(|h| h.memory.id).collect();
     let _ = db::bump_access(conn, &ids);
@@ -211,7 +228,7 @@ pub fn format_hits(hits: &[Hit]) -> String {
         };
         let _ = writeln!(
             out,
-            "[{}] ({}, {}{}) {}{}{} rrf={:.4}",
+            "[{}] ({}, {}{}) {}{}{} score={:.4}",
             m.id, m.kind, project, scope, m.agent, tag, vote_tag, h.score
         );
         let _ = writeln!(out, "    {}", h.snippet);
@@ -249,6 +266,34 @@ mod tests {
         assert!(vote_multiplier(0, 3) < 1.0);
         assert!(vote_multiplier(100, 0) <= 1.3);
         assert!(vote_multiplier(0, 100) >= 0.7);
+    }
+
+    #[test]
+    fn votes_reorder_within_limit_after_overfetch() {
+        let dir = std::env::temp_dir().join(format!("ams_search_votes_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.db");
+        let _ = std::fs::remove_file(&path);
+        let conn = crate::db::open_db_at(&path).unwrap();
+
+        let insert = |text: &str| {
+            let raw = crate::db::insert_raw(&conn, "a", "", "fact", "own", text, "").unwrap();
+            crate::db::insert_memory(
+                &conn, raw, "a", "", "fact", "own", text, "", "canonical", 0.6, None,
+            )
+            .unwrap()
+        };
+        let best = insert("kubernetes kubernetes kubernetes rollout guide");
+        let second = insert("kubernetes kubernetes notes");
+        let voted = insert("kubernetes brief mention");
+        for (i, agent) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            crate::db::cast_vote(&conn, voted, agent, &format!("s{i}"), 1, "").unwrap();
+        }
+
+        let hits = search_with_vector(&conn, "a", None, "kubernetes", 2, None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].memory.id, voted, "vote boost should lift it into the top 2");
+        assert!(hits.iter().any(|h| h.memory.id == best || h.memory.id == second));
     }
 
     #[test]

@@ -150,6 +150,28 @@ CREATE TABLE IF NOT EXISTS memory_votes (
 CREATE INDEX IF NOT EXISTS idx_votes_memory ON memory_votes(memory_id);
 ";
 
+// v3: per-project digests, one non-archived memory per (agent, content hash),
+// and a dedupe of any rows written before the index existed.
+const SCHEMA_V3: &str = "
+CREATE TABLE digest_project (
+  agent TEXT NOT NULL,
+  project TEXT NOT NULL,
+  content TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (agent, project));
+INSERT OR REPLACE INTO digest_project (agent, project, content, updated_at)
+  SELECT agent, '', content, updated_at FROM digest;
+DROP TABLE digest;
+ALTER TABLE digest_project RENAME TO digest;
+
+UPDATE memories SET status = 'archived'
+ WHERE status != 'archived' AND id NOT IN (
+   SELECT MIN(id) FROM memories WHERE status != 'archived' GROUP BY agent, content_hash);
+
+CREATE UNIQUE INDEX idx_mem_unique_hash
+  ON memories(agent, content_hash) WHERE status != 'archived';
+";
+
 pub fn config_db_path() -> PathBuf {
     if let Ok(p) = std::env::var("AMS_DB")
         && !p.is_empty()
@@ -162,6 +184,17 @@ pub fn config_db_path() -> PathBuf {
 
 pub fn open_db() -> rusqlite::Result<Connection> {
     open_db_at(&config_db_path())
+}
+
+/// Identifier for one process's session, used when a caller does not supply
+/// one. Keeps the "one vote per agent per session" rule meaningful even when
+/// the host gives agents no session id.
+pub fn new_session_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("p{}-{:x}", std::process::id(), nanos)
 }
 
 pub fn open_db_at(path: &Path) -> rusqlite::Result<Connection> {
@@ -186,6 +219,11 @@ pub fn open_db_at(path: &Path) -> rusqlite::Result<Connection> {
     if version < 2 {
         conn.execute_batch(SCHEMA_V2)?;
         conn.pragma_update(None, "user_version", 2)?;
+        version = 2;
+    }
+    if version < 3 {
+        conn.execute_batch(SCHEMA_V3)?;
+        conn.pragma_update(None, "user_version", 3)?;
     }
     // A model or text-recipe swap makes every stored vector a different
     // vector space. Warn once; `ams reembed` rebuilds them.
@@ -211,7 +249,6 @@ pub fn open_db_at(path: &Path) -> rusqlite::Result<Connection> {
 #[derive(Debug, Clone)]
 pub struct RawRecord {
     pub id: i64,
-    pub agent: String,
     pub source_session: String,
 }
 
@@ -341,6 +378,19 @@ pub fn update_memory(
     expires_at: Option<i64>,
     op: &str,
 ) -> rusqlite::Result<()> {
+    // No-op updates (curator restating an unchanged memory) must not churn the
+    // version log. A provisional memory still needs the status promotion.
+    if let Some(cur) = get_memory(conn, id)?
+        && cur.status == "canonical"
+        && cur.content == content
+        && cur.tags == tags
+        && cur.kind == kind
+        && cur.scope == scope
+        && (cur.confidence - confidence).abs() < 1e-9
+        && cur.expires_at == expires_at
+    {
+        return Ok(());
+    }
     let version: i64 = conn.query_row("SELECT version FROM memories WHERE id = ?1", params![id], |r| {
         r.get(0)
     })?;
@@ -485,13 +535,31 @@ pub fn merge_votes(conn: &Connection, from_id: i64, to_id: i64) -> rusqlite::Res
     Ok(())
 }
 
-/// Archive memories whose reinforcement timer ran out.
-pub fn archive_expired(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.execute(
+#[derive(Debug, Default)]
+pub struct ExpiredSweep {
+    pub archived: usize,
+    /// (agent, project) pairs whose digest may now be stale.
+    pub targets: Vec<(String, String)>,
+}
+
+/// Archive memories whose reinforcement timer ran out, reporting which
+/// agent/project digests need a refresh afterwards.
+pub fn archive_expired(conn: &Connection) -> rusqlite::Result<ExpiredSweep> {
+    let t = now();
+    let targets: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT agent, project FROM memories
+             WHERE status != 'archived' AND expires_at IS NOT NULL AND expires_at <= ?1",
+        )?;
+        let rows = stmt.query_map(params![t], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let archived = conn.execute(
         "UPDATE memories SET status = 'archived', updated_at = ?1
          WHERE status != 'archived' AND expires_at IS NOT NULL AND expires_at <= ?1",
-        params![now()],
-    )
+        params![t],
+    )?;
+    Ok(ExpiredSweep { archived, targets })
 }
 
 pub fn get_memory(conn: &Connection, id: i64) -> rusqlite::Result<Option<Memory>> {
@@ -640,14 +708,13 @@ pub fn pending_raw(
     limit: i64,
 ) -> rusqlite::Result<Vec<RawRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT id, agent, source_session
+        "SELECT id, source_session
          FROM raw_memories WHERE consumed_at IS NULL ORDER BY id LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![limit], |r| {
         Ok(RawRecord {
             id: r.get(0)?,
-            agent: r.get(1)?,
-            source_session: r.get(2)?,
+            source_session: r.get(1)?,
         })
     })?;
     rows.collect()
@@ -697,20 +764,33 @@ pub fn set_consumer(
     Ok(())
 }
 
-pub fn get_digest(conn: &Connection, agent: &str) -> rusqlite::Result<Option<String>> {
+pub fn get_digest(conn: &Connection, agent: &str, project: &str) -> rusqlite::Result<Option<String>> {
     conn.query_row(
-        "SELECT content FROM digest WHERE agent = ?1",
-        params![agent],
+        "SELECT content FROM digest WHERE agent = ?1 AND project = ?2",
+        params![agent, project],
         |r| r.get(0),
     )
     .optional()
 }
 
-pub fn set_digest(conn: &Connection, agent: &str, content: &str) -> rusqlite::Result<()> {
+/// Every project digest for an agent, ordered by project.
+pub fn digests_for_agent(conn: &Connection, agent: &str) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT project, content FROM digest WHERE agent = ?1 ORDER BY project")?;
+    let rows = stmt.query_map(params![agent], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+pub fn set_digest(
+    conn: &Connection,
+    agent: &str,
+    project: &str,
+    content: &str,
+) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO digest (agent, content, updated_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(agent) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
-        params![agent, content, now()],
+        "INSERT INTO digest (agent, project, content, updated_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(agent, project) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+        params![agent, project, content, now()],
     )?;
     Ok(())
 }
@@ -789,8 +869,10 @@ pub fn restore_version(conn: &Connection, version_id: i64) -> rusqlite::Result<i
     let v = version + 1;
     tx.execute(
         "UPDATE memories SET content = ?2, updated_at = ?3, version = ?4, status = 'canonical',
-           content_hash = ?5 WHERE id = ?1",
-        params![memory_id, content, now(), v, content_hash(&content)],
+           content_hash = ?5, superseded_by = NULL,
+           expires_at = CASE WHEN kind = 'procedure' THEN NULL ELSE ?6 END
+         WHERE id = ?1",
+        params![memory_id, content, now(), v, content_hash(&content), now() + ttl_secs()],
     )?;
     insert_version(&tx, memory_id, v, &content, "restore")?;
     tx.commit()?;
@@ -865,7 +947,7 @@ mod tests {
     fn schema_initializes() {
         let conn = temp_db("schema");
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
         // sqlite-vec is loaded and the vec0 table exists
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM memories_vec", [], |r| r.get(0))
@@ -1041,7 +1123,9 @@ mod tests {
         let old = mem(&conn, "a", "stale", Some(now() - 1));
         let fresh = mem(&conn, "a", "fresh", Some(now() + 1000));
         let eternal = mem(&conn, "a", "eternal", None);
-        assert_eq!(archive_expired(&conn).unwrap(), 1);
+        let sweep = archive_expired(&conn).unwrap();
+        assert_eq!(sweep.archived, 1);
+        assert_eq!(sweep.targets, vec![("a".to_string(), String::new())]);
         assert_eq!(get_memory(&conn, old).unwrap().unwrap().status, "archived");
         assert_eq!(get_memory(&conn, fresh).unwrap().unwrap().status, "canonical");
         assert_eq!(get_memory(&conn, eternal).unwrap().unwrap().status, "canonical");
@@ -1055,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_upgrades_to_v2() {
+    fn v1_database_upgrades_to_latest() {
         let dir = std::env::temp_dir().join(format!("ams_test_upgrade_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("memory.db");
@@ -1072,10 +1156,64 @@ mod tests {
         }
         let conn = open_db_at(&path).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM memory_votes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn duplicate_content_rejected_until_archived() {
+        let conn = temp_db("unique_hash");
+        let first = mem(&conn, "a", "same text", None);
+        let raw = insert_raw(&conn, "a", "", "fact", "own", "same text", "").unwrap();
+        let err = insert_memory(
+            &conn, raw, "a", "", "fact", "own", "same text", "", "provisional", 0.6, None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::ConstraintViolation
+        ));
+        // A different agent may hold the same text.
+        mem(&conn, "b", "same text", None);
+        // Archiving the original frees the hash for this agent.
+        archive_memory(&conn, first, None).unwrap();
+        let raw2 = insert_raw(&conn, "a", "", "fact", "own", "same text", "").unwrap();
+        insert_memory(
+            &conn, raw2, "a", "", "fact", "own", "same text", "", "provisional", 0.6, None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn restore_clears_expiry_and_supersession() {
+        let conn = temp_db("restore_expiry");
+        let id = mem(&conn, "a", "restorable content", Some(now() - 100));
+        archive_memory(&conn, id, Some(id)).unwrap();
+        let vid = versions(&conn, id).unwrap()[0].id;
+        restore_version(&conn, vid).unwrap();
+        let m = get_memory(&conn, id).unwrap().unwrap();
+        assert_eq!(m.status, "canonical");
+        assert!(m.superseded_by.is_none());
+        assert!(m.expires_at.unwrap() > now());
+        assert_eq!(
+            fts_search(&conn, "\"restorable\"", "a", None, 10).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn digests_are_per_project() {
+        let conn = temp_db("digest");
+        set_digest(&conn, "a", "alpha", "alpha facts").unwrap();
+        set_digest(&conn, "a", "beta", "beta facts").unwrap();
+        assert_eq!(
+            get_digest(&conn, "a", "alpha").unwrap().as_deref(),
+            Some("alpha facts")
+        );
+        let all = digests_for_agent(&conn, "a").unwrap();
+        assert_eq!(all.len(), 2);
     }
 }

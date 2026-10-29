@@ -40,8 +40,8 @@ Call the MCP tool `remember` with:
 | `project` | Repository/project name, e.g. `ams` or `acme/backend` |
 | `kind` | `troubleshoot` or `correction` (see below) |
 | `content` | The structured record, ≤ 2000 chars (see templates) |
-| `scope` | `own` (default). The curator may promote project-independent facts to `shared`. |
-| `source_session` | Optional session id, if the host provides one |
+| `scope` | Always stored as `own`; curation decides promotion to `shared`. |
+| `source_session` | Optional provenance id, if the host provides one |
 
 Keep **one fact per call**. If you learned three independent things, write three
 memories. Small records embed fully and match precisely; a wall of text matches nothing.
@@ -103,7 +103,8 @@ Memory only stays useful if agents report back. Two signals:
 
 1. **It worked.** Once you actually applied a memory and verified the result, call the
    MCP tool `vote` with `vote: "up"`. This confirms the memory and resets its expiry
-   timer. Passing a `session` id limits you to one vote per memory per session.
+   timer. If your host gives you a session id, pass it; otherwise the server uses the
+   current MCP process, so you still get one vote per session.
 2. **It was wrong or outdated.** Call `vote` with `vote: "down"`, then write a
    `correction` memory that supersedes it. Never downvote a memory you did not use.
 

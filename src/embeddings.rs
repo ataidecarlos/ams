@@ -6,7 +6,12 @@ use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 /// Model identity, stored alongside vectors so a model swap invalidates them.
 pub const MODEL_NAME: &str = "BGESmallENV15";
 /// Bump when the text fed to the model changes (not when the model changes).
-const TEXT_VERSION: u32 = 1;
+const TEXT_VERSION: u32 = 2;
+
+/// BGE v1.5 recipe: passages are embedded as-is; only queries carry the
+/// retrieval instruction. (E5-style `passage:`/`query:` prefixes are for a
+/// different model family and cost retrieval quality here.)
+const QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
 
 /// BGE-small-en-v1.5 output size. `db.rs` hardcodes this in the vec0 schema;
 /// a different-dimension model needs a schema migration.
@@ -70,18 +75,17 @@ pub fn warm() -> bool {
     with_model(|_| ()).is_some()
 }
 
-/// Embed documents for indexing, with the passage-side prefix BGE was trained with.
+/// Embed documents for indexing. BGE v1.5 uses no passage-side prefix.
 pub fn embed_documents(texts: &[String]) -> Option<Vec<Vec<f32>>> {
     if texts.is_empty() {
         return Some(Vec::new());
     }
-    let prefixed: Vec<String> = texts.iter().map(|t| format!("passage: {}", t)).collect();
-    with_model(|m| m.embed(prefixed, None).ok())?
+    with_model(|m| m.embed(texts.to_vec(), None).ok())?
 }
 
-/// Embed a single query, with the matching query-side prefix.
+/// Embed a single query, with BGE's retrieval instruction.
 pub fn embed_query(text: &str) -> Option<Vec<f32>> {
-    let prefixed = format!("query: {}", text);
+    let prefixed = format!("{QUERY_INSTRUCTION}{text}");
     with_model(|m| m.embed(vec![prefixed], None).ok())?.and_then(|v| v.into_iter().next())
 }
 

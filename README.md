@@ -88,10 +88,14 @@ Three ranked signals fused with RRF (`k=60`):
 
 1. **Lexical** — FTS5 `porter unicode61`, bm25 with tags weighted 4× over content. Every
    query token is quoted, so arbitrary agent input is always valid FTS syntax. If the
-   ANDed query misses, an OR-relaxed retry runs.
+   ANDed query misses, an OR-relaxed retry runs, but a hit must contain at least two
+   distinct content tokens (or all of them, for short queries) — otherwise a query like
+   "write a haiku" matches a memory because it contains "write".
 2. **Semantic** — sqlite-vec `vec0` KNN over BGE-small-en-v1.5 vectors (cosine, 384
-   dims, `passage:`/`query:` prefixes). Candidates are gated twice: absolute similarity
-   ≥ 0.50 and ≥ 85% of the query's own top score.
+   dims). Documents are embedded as-is and queries carry BGE v1.5's retrieval
+   instruction, per the model's documented recipe. Candidates are gated twice: absolute
+   similarity ≥ 0.55 and ≥ 85% of the query's own top score. `AMS_DEBUG_SCORES=1` prints
+   the raw scores to stderr for re-calibration.
 3. **Recency** — candidates found by signals 1–2, ordered by creation time. Recency only
    reorders relevant memories; it never injects unrelated fresh ones.
 
@@ -173,12 +177,25 @@ ams reembed                             rebuild vectors after a model change
 | `AMS_MEMORY_TTL_DAYS` | `90` | expiry for new memories without reinforcement |
 | `AMS_MODEL_CACHE` | platform cache dir | embedding model cache |
 
+## Testing retrieval
+
+```bash
+cargo build
+python bench/retrieval.py
+```
+
+Seeds a throwaway database with 14 realistic memories, runs 16 queries with known
+answers (lexical, paraphrase, cross-vocabulary, cross-agent, other-project, plus three
+negative controls), and prints rank or miss per query. Exits non-zero on failure. Run it
+after any change to tokenization, embeddings, gating or ranking.
+
 ## Limits and caveats
 
 - Writes are capped at 2000 chars so the 512-token embedding window covers the whole
   record. Longer input is truncated with an ellipsis.
-- The semantic gate thresholds are uncalibrated for real memory corpora (see the
-  `shortcut:` comment in `src/search.rs`). Tune them once real data exists.
+- The semantic thresholds (0.55 absolute, 85% relative) are calibrated on the 14-record
+  bench corpus. Re-measure with `AMS_DEBUG_SCORES=1` once real memory volume changes the
+  score distribution.
 - Agent identity is self-reported. A misconfigured agent can pollute `shared`; the
   correction/archive path (`supersedes_id`, `memory_versions`, `ams restore`) is the
   cleanup route.

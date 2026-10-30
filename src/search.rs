@@ -5,9 +5,10 @@ use rusqlite::Connection;
 use crate::db;
 use crate::embeddings;
 
-/// Absolute similarity floor for a semantic hit. Below this, BGE-small scores
-/// are corpus noise even when they are the best available match.
-const MIN_SEMANTIC_SCORE: f32 = 0.50;
+/// Absolute similarity floor for a semantic hit. Measured on the bench corpus:
+/// unrelated queries top out around 0.50, genuine cross-vocabulary matches
+/// start around 0.64. Re-calibrate with `AMS_DEBUG_SCORES=1` on real data.
+const MIN_SEMANTIC_SCORE: f32 = 0.55;
 /// Candidates must also be within this fraction of the query's own best score,
 /// which adapts to how sharply this query separates its matches.
 const RELATIVE_FLOOR: f32 = 0.85;
@@ -34,9 +35,9 @@ pub fn fts_match(query: &str, or: bool) -> String {
 /// Keep semantic candidates that clear both the absolute floor and 85% of the
 /// best score for this query. `scores` is expected sorted descending.
 ///
-/// shortcut: thresholds are uncalibrated guesses for BGE-small; the md_jumper
-/// z-score gate does not transfer because KNN only exposes the top-k
-/// distribution, not the corpus distribution. Tune on real memory data.
+/// Calibrated on the bench corpus (`bench/retrieval.py`): unrelated queries top
+/// out near 0.50, genuine cross-vocabulary matches start near 0.64. Re-measure
+/// with `AMS_DEBUG_SCORES=1` when real memory data changes the distribution.
 fn semantic_gate(scores: &mut Vec<(i64, f32)>) {
     scores.retain(|(_, s)| *s >= MIN_SEMANTIC_SCORE);
     let Some(top) = scores.first().map(|(_, s)| *s) else {
@@ -113,8 +114,26 @@ pub fn search_with_vector(
         .map_err(|e| format!("search failed: {e}"))?;
     if lexical.is_empty() && query.split_whitespace().count() > 1 {
         let or_expr = fts_match(query, true);
-        lexical = db::fts_search(conn, &or_expr, agent, project, pool as i64)
+        let candidates = db::fts_search(conn, &or_expr, agent, project, pool as i64)
             .map_err(|e| format!("search failed: {e}"))?;
+        // An OR match on one common word ("do", "write") is noise: require at
+        // least two distinct content tokens in the hit, unless the query only
+        // has one.
+        let tokens = content_tokens(query);
+        let needed = tokens.len().min(2);
+        lexical = candidates
+            .into_iter()
+            .filter(|(id, _)| {
+                if needed == 0 {
+                    return false;
+                }
+                db::get_memory(conn, *id)
+                    .ok()
+                    .flatten()
+                    .map(|m| count_token_hits(&m.content, &tokens) >= needed)
+                    .unwrap_or(false)
+            })
+            .collect();
     }
 
     // Signal 2: semantic KNN. Absent model => silently skip; FTS still works.
@@ -131,6 +150,16 @@ pub fn search_with_vector(
         None => Vec::new(),
     };
     semantic.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Calibration aid: AMS_DEBUG_SCORES=1 prints the raw cosine scores that
+    // the gate is about to accept or reject.
+    if std::env::var_os("AMS_DEBUG_SCORES").is_some() {
+        use std::fmt::Write as _;
+        let mut dbg = String::from("ams: semantic scores:");
+        for (id, s) in semantic.iter().take(10) {
+            let _ = write!(dbg, " {}:{:.3}", id, s);
+        }
+        eprintln!("{dbg}");
+    }
     semantic_gate(&mut semantic);
     semantic.truncate(pool);
 
@@ -204,6 +233,25 @@ fn first_line(s: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// Query tokens long enough to carry meaning, lowercased and deduplicated.
+/// Used to keep the OR fallback from matching on filler words.
+fn content_tokens(query: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    query
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|t| t.chars().count() >= 3 && seen.insert(t.clone()))
+        .collect()
+}
+
+/// Rough stem-tolerant check: a token counts as present when the lowercased
+/// content contains it. Good enough for gating the OR fallback; FTS5 does the
+/// real matching.
+fn count_token_hits(content: &str, tokens: &[String]) -> usize {
+    let text = content.to_lowercase();
+    tokens.iter().filter(|t| text.contains(t.as_str())).count()
 }
 
 /// Human-readable hit list used by both the CLI and the MCP `search` tool.
@@ -294,6 +342,20 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].memory.id, voted, "vote boost should lift it into the top 2");
         assert!(hits.iter().any(|h| h.memory.id == best || h.memory.id == second));
+    }
+
+    #[test]
+    fn content_tokens_ignore_filler() {
+        assert_eq!(content_tokens("how do I write a haiku"), vec!["how", "write", "haiku"]);
+        assert!(content_tokens("a b c").is_empty());
+        assert_eq!(content_tokens("Docker docker"), vec!["docker"]);
+    }
+
+    #[test]
+    fn token_hits_count_distinct_matches() {
+        let tokens = content_tokens("docker disk full");
+        assert_eq!(count_token_hits("docker build fails, no space on disk", &tokens), 2);
+        assert_eq!(count_token_hits("unrelated text", &tokens), 0);
     }
 
     #[test]

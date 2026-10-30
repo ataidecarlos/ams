@@ -8,13 +8,12 @@ use crate::embeddings;
 /// Semantic floor for a corpus of `n` visible memories. The best cosine score
 /// of an unrelated query grows with corpus size (extreme-value effect), so a
 /// fixed floor rejects true matches on small corpora and admits noise on large
-/// ones. Calibrated on two measured corpora: 14 records (noise ≤ 0.50, true
-/// matches ≥ 0.64) and 7056 records (noise ≤ 0.60, true matches ≥ 0.74).
-/// Re-measure with `AMS_DEBUG_SCORES=1` when adding very different data.
+/// ones. Calibrated on measured corpora of 14 and 7056 records.
 fn adaptive_floor(n: i64) -> f32 {
     let n = n.max(10) as f32;
     (0.55 + 0.04 * (n / 10.0).log10()).min(0.78)
 }
+
 /// Candidates must also be within this fraction of the query's own best score,
 /// which adapts to how sharply this query separates its matches.
 const RELATIVE_FLOOR: f32 = 0.85;
@@ -40,10 +39,6 @@ pub fn fts_match(query: &str, or: bool) -> String {
 
 /// Keep semantic candidates that clear both the absolute floor and 85% of the
 /// best score for this query. `scores` is expected sorted descending.
-///
-/// Calibrated on the bench corpus (`bench/retrieval.py`): unrelated queries top
-/// out near 0.50, genuine cross-vocabulary matches start near 0.64. Re-measure
-/// with `AMS_DEBUG_SCORES=1` when real memory data changes the distribution.
 fn semantic_gate(scores: &mut Vec<(i64, f32)>, floor: f32) {
     scores.retain(|(_, s)| *s >= floor);
     let Some(top) = scores.first().map(|(_, s)| *s) else {
@@ -165,38 +160,6 @@ pub fn search_with_vector(
     };
     semantic.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let floor = adaptive_floor(db::visible_count(conn, agent, project).unwrap_or(0));
-    // Calibration aid: AMS_DEBUG_SCORES=1 prints the raw cosine scores that
-    // the gate is about to accept or reject.
-    if std::env::var_os("AMS_DEBUG_SCORES").is_some() {
-        use std::fmt::Write as _;
-        let mut dbg = String::from("ams: semantic scores:");
-        for (id, s) in semantic.iter().take(10) {
-            let _ = write!(dbg, " {}:{:.3}", id, s);
-        }
-        if !semantic.is_empty() {
-            let n = semantic.len() as f32;
-            let mean = semantic.iter().map(|(_, s)| s).sum::<f32>() / n;
-            let sd = (semantic
-                .iter()
-                .map(|(_, s)| (s - mean).powi(2))
-                .sum::<f32>()
-                / n)
-                .sqrt()
-                .max(1e-6);
-            let top = semantic[0].1;
-            let _ = write!(
-                dbg,
-                "\nams: stats: n={} top={:.3} mean={:.3} sd={:.3} z={:.2} floor={:.3}",
-                semantic.len(),
-                top,
-                mean,
-                sd,
-                (top - mean) / sd,
-                floor
-            );
-        }
-        eprintln!("{dbg}");
-    }
     semantic_gate(&mut semantic, floor);
     semantic.truncate(pool);
 

@@ -1,7 +1,6 @@
 mod curator;
 mod db;
 mod embeddings;
-mod import;
 mod mcp;
 mod search;
 
@@ -83,19 +82,6 @@ enum Sub {
     /// Rebuild every vector with the current embedding model (after a model
     /// or text-recipe change)
     Reembed,
-    /// Ingest a markdown tree as canonical memories (corpus bootstrap/bench)
-    Import {
-        #[arg(long)]
-        agent: String,
-        #[arg(long)]
-        project: String,
-        #[arg(long, default_value = "fact")]
-        kind: String,
-        #[arg(long)]
-        dir: std::path::PathBuf,
-        #[arg(long, default_value_t = 1200)]
-        chunk_chars: usize,
-    },
 }
 
 fn main() {
@@ -259,30 +245,6 @@ fn run(conn: &Connection, cmd: Sub) -> Result<(), String> {
             db::set_meta(conn, "vector_model", &embeddings::model_id())
                 .map_err(|e| e.to_string())?;
             println!("re-embedded {done} memor{}", if done == 1 { "y" } else { "ies" });
-        }
-        Sub::Import {
-            agent,
-            project,
-            kind,
-            dir,
-            chunk_chars,
-        } => {
-            if !curator::is_kind(&kind) {
-                return Err(format!(
-                    "invalid kind `{kind}`; expected troubleshoot|correction|fact|procedure"
-                ));
-            }
-            let started = std::time::Instant::now();
-            let summary = import::import_dir(conn, &agent, &project, &kind, &dir, chunk_chars)?;
-            println!(
-                "imported: {} file(s), {} chunk(s), {} inserted, {} duplicate(s), {} skipped in {:.1}s",
-                summary.files,
-                summary.chunks,
-                summary.inserted,
-                summary.duplicates,
-                summary.skipped,
-                started.elapsed().as_secs_f32()
-            );
         }
     }
     Ok(())

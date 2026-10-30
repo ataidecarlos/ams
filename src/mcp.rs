@@ -31,14 +31,6 @@ fn default_session() -> &'static str {
     SESSION.get_or_init(db::new_session_id)
 }
 
-fn is_unique_violation(e: &rusqlite::Error) -> bool {
-    matches!(
-        e,
-        rusqlite::Error::SqliteFailure(err, _)
-            if err.code == rusqlite::ErrorCode::ConstraintViolation
-    )
-}
-
 // ---------------------------------------------------------------- tools
 
 /// A write that duplicates an existing memory: keep the raw record for the
@@ -122,7 +114,7 @@ pub fn tool_remember(conn: &Connection, args: &Value) -> Result<String, String> 
             tx.commit().map_err(|e| e.to_string())?;
             id
         }
-        Err(e) if is_unique_violation(&e) => {
+        Err(e) if db::is_unique_violation(&e) => {
             drop(tx); // rolls back
             let Some(existing) = db::find_duplicate(conn, agent, &hash).map_err(|e| e.to_string())?
             else {

@@ -93,9 +93,11 @@ Three ranked signals fused with RRF (`k=60`):
    "write a haiku" matches a memory because it contains "write".
 2. **Semantic** — sqlite-vec `vec0` KNN over BGE-small-en-v1.5 vectors (cosine, 384
    dims). Documents are embedded as-is and queries carry BGE v1.5's retrieval
-   instruction, per the model's documented recipe. Candidates are gated twice: absolute
-   similarity ≥ 0.55 and ≥ 85% of the query's own top score. `AMS_DEBUG_SCORES=1` prints
-   the raw scores to stderr for re-calibration.
+   instruction, per the model's documented recipe. Candidates are gated twice: an
+   absolute floor that scales with corpus size (`0.55 + 0.04·log10(n/10)`, capped at
+   0.78, because the best cosine of an unrelated query grows with corpus size) and ≥
+   85% of the query's own top score. `AMS_DEBUG_SCORES=1` prints raw scores, the
+   distribution stats and the active floor.
 3. **Recency** — candidates found by signals 1–2, ordered by creation time. Recency only
    reorders relevant memories; it never injects unrelated fresh ones.
 
@@ -161,6 +163,8 @@ ams stats
 ams history <memory_id>
 ams restore <version_id>
 ams reembed                             rebuild vectors after a model change
+ams import --agent A --project P --dir D [--kind fact] [--chunk-chars 1200]
+                                        ingest a markdown tree as canonical memories
 ```
 
 ## Configuration
@@ -177,25 +181,36 @@ ams reembed                             rebuild vectors after a model change
 | `AMS_MEMORY_TTL_DAYS` | `90` | expiry for new memories without reinforcement |
 | `AMS_MODEL_CACHE` | platform cache dir | embedding model cache |
 
+Results show the source file (`<- database/foo.md`) when the memory came from an
+imported corpus.
+
 ## Testing retrieval
 
 ```bash
 cargo build
-python bench/retrieval.py
+python bench/retrieval.py        # 14 seeded memories, 16 queries, ~40 s
+python bench/corpus.py           # ingest sql-docs and run 115 queries through MCP
+python bench/corpus.py --db PATH # reuse an existing corpus database
 ```
 
-Seeds a throwaway database with 14 realistic memories, runs 16 queries with known
-answers (lexical, paraphrase, cross-vocabulary, cross-agent, other-project, plus three
-negative controls), and prints rank or miss per query. Exits non-zero on failure. Run it
-after any change to tokenization, embeddings, gating or ranking.
+`retrieval.py` is the fast smoke test. `corpus.py` ingests a real markdown corpus
+(default `C:\Users\ataid\projects\sql-docs`, 351 files, ~7k memories) and reports:
+
+- heading queries: chunk rank@1/5 and file rank@1/5/MRR (unique headings only)
+- paraphrase queries: whether the expected phrase appears in the top-5 chunk content
+- negative queries: false positives
+- latency per MCP search round trip
+
+Last measured on sql-docs: chunk rank@1 67%, chunk rank@5 92%, file rank@5 95%,
+paraphrase 10/10, negatives 0/5 false positives, p50 63 ms / p95 108 ms.
 
 ## Limits and caveats
 
 - Writes are capped at 2000 chars so the 512-token embedding window covers the whole
   record. Longer input is truncated with an ellipsis.
-- The semantic thresholds (0.55 absolute, 85% relative) are calibrated on the 14-record
-  bench corpus. Re-measure with `AMS_DEBUG_SCORES=1` once real memory volume changes the
-  score distribution.
+- The semantic floor is a fitted heuristic (`0.55 + 0.04·log10(n/10)`), calibrated on a
+  14-record corpus and the 7056-record sql-docs corpus. It is not a learned calibration;
+  re-measure with `AMS_DEBUG_SCORES=1` when adding very different data.
 - Agent identity is self-reported. A misconfigured agent can pollute `shared`; the
   correction/archive path (`supersedes_id`, `memory_versions`, `ams restore`) is the
   cleanup route.

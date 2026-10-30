@@ -5,10 +5,16 @@ use rusqlite::Connection;
 use crate::db;
 use crate::embeddings;
 
-/// Absolute similarity floor for a semantic hit. Measured on the bench corpus:
-/// unrelated queries top out around 0.50, genuine cross-vocabulary matches
-/// start around 0.64. Re-calibrate with `AMS_DEBUG_SCORES=1` on real data.
-const MIN_SEMANTIC_SCORE: f32 = 0.55;
+/// Semantic floor for a corpus of `n` visible memories. The best cosine score
+/// of an unrelated query grows with corpus size (extreme-value effect), so a
+/// fixed floor rejects true matches on small corpora and admits noise on large
+/// ones. Calibrated on two measured corpora: 14 records (noise ≤ 0.50, true
+/// matches ≥ 0.64) and 7056 records (noise ≤ 0.60, true matches ≥ 0.74).
+/// Re-measure with `AMS_DEBUG_SCORES=1` when adding very different data.
+fn adaptive_floor(n: i64) -> f32 {
+    let n = n.max(10) as f32;
+    (0.55 + 0.04 * (n / 10.0).log10()).min(0.78)
+}
 /// Candidates must also be within this fraction of the query's own best score,
 /// which adapts to how sharply this query separates its matches.
 const RELATIVE_FLOOR: f32 = 0.85;
@@ -38,8 +44,8 @@ pub fn fts_match(query: &str, or: bool) -> String {
 /// Calibrated on the bench corpus (`bench/retrieval.py`): unrelated queries top
 /// out near 0.50, genuine cross-vocabulary matches start near 0.64. Re-measure
 /// with `AMS_DEBUG_SCORES=1` when real memory data changes the distribution.
-fn semantic_gate(scores: &mut Vec<(i64, f32)>) {
-    scores.retain(|(_, s)| *s >= MIN_SEMANTIC_SCORE);
+fn semantic_gate(scores: &mut Vec<(i64, f32)>, floor: f32) {
+    scores.retain(|(_, s)| *s >= floor);
     let Some(top) = scores.first().map(|(_, s)| *s) else {
         return;
     };
@@ -64,7 +70,12 @@ pub fn rrf_merge(lists: &[Vec<i64>], k: f64, limit: usize) -> Vec<(i64, f64)> {
         }
     }
     let mut merged: Vec<(i64, f64)> = scores.into_iter().collect();
-    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Deterministic order: score descending, id ascending on ties.
+    merged.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     merged.truncate(limit);
     merged
 }
@@ -75,6 +86,8 @@ pub struct Hit {
     pub snippet: String,
     pub semantic_only: bool,
     pub score: f64,
+    /// Source file path for imported corpus memories.
+    pub source: Option<String>,
 }
 
 /// Hybrid retrieval over memories the agent may see: lexical (FTS5) and
@@ -120,20 +133,21 @@ pub fn search_with_vector(
         // least two distinct content tokens in the hit, unless the query only
         // has one.
         let tokens = content_tokens(query);
-        let needed = tokens.len().min(2);
-        lexical = candidates
+        // The AND query already failed, so no document had every token. Demand
+        // two thirds of the content tokens: "best hiking trails in norway"
+        // must not match a document through "best" and "trails" alone.
+        let needed = (tokens.len() * 2).div_ceil(3).clamp(1, tokens.len().max(1));
+        let mut scored: Vec<(usize, (i64, String))> = candidates
             .into_iter()
-            .filter(|(id, _)| {
-                if needed == 0 {
-                    return false;
-                }
-                db::get_memory(conn, *id)
-                    .ok()
-                    .flatten()
-                    .map(|m| count_token_hits(&m.content, &tokens) >= needed)
-                    .unwrap_or(false)
+            .filter_map(|hit| {
+                let m = db::get_memory(conn, hit.0).ok().flatten()?;
+                let hits = count_token_hits(&m.content, &tokens);
+                (hits >= needed && needed > 0).then_some((hits, hit))
             })
             .collect();
+        // Prefer hits that cover more query terms; keep bm25 order on ties.
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        lexical = scored.into_iter().map(|(_, hit)| hit).collect();
     }
 
     // Signal 2: semantic KNN. Absent model => silently skip; FTS still works.
@@ -150,6 +164,7 @@ pub fn search_with_vector(
         None => Vec::new(),
     };
     semantic.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let floor = adaptive_floor(db::visible_count(conn, agent, project).unwrap_or(0));
     // Calibration aid: AMS_DEBUG_SCORES=1 prints the raw cosine scores that
     // the gate is about to accept or reject.
     if std::env::var_os("AMS_DEBUG_SCORES").is_some() {
@@ -158,9 +173,31 @@ pub fn search_with_vector(
         for (id, s) in semantic.iter().take(10) {
             let _ = write!(dbg, " {}:{:.3}", id, s);
         }
+        if !semantic.is_empty() {
+            let n = semantic.len() as f32;
+            let mean = semantic.iter().map(|(_, s)| s).sum::<f32>() / n;
+            let sd = (semantic
+                .iter()
+                .map(|(_, s)| (s - mean).powi(2))
+                .sum::<f32>()
+                / n)
+                .sqrt()
+                .max(1e-6);
+            let top = semantic[0].1;
+            let _ = write!(
+                dbg,
+                "\nams: stats: n={} top={:.3} mean={:.3} sd={:.3} z={:.2} floor={:.3}",
+                semantic.len(),
+                top,
+                mean,
+                sd,
+                (top - mean) / sd,
+                floor
+            );
+        }
         eprintln!("{dbg}");
     }
-    semantic_gate(&mut semantic);
+    semantic_gate(&mut semantic, floor);
     semantic.truncate(pool);
 
     let lexical_ids: Vec<i64> = lexical.iter().map(|(id, _)| *id).collect();
@@ -169,16 +206,25 @@ pub fn search_with_vector(
 
     // Signal 3: recency, restricted to candidates the other signals found, so
     // it only reorders relevant memories instead of injecting fresh noise.
-    let union: Vec<i64> = lexical_ids
+    let mut union: Vec<i64> = lexical_ids
         .iter()
         .chain(semantic_ids.iter())
         .copied()
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
+    union.sort_unstable();
     let created = db::created_at_map(conn, &union).map_err(|e| e.to_string())?;
     let mut recency: Vec<i64> = union.clone();
-    recency.sort_by_key(|id| std::cmp::Reverse(created.get(id).copied().unwrap_or(0)));
+    // Deterministic: newest first, id ascending on equal timestamps.
+    recency.sort_by(|a, b| {
+        created
+            .get(b)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&created.get(a).copied().unwrap_or(0))
+            .then(a.cmp(b))
+    });
 
     let mut lists: Vec<Vec<i64>> = Vec::new();
     if !lexical_ids.is_empty() {
@@ -215,13 +261,23 @@ pub fn search_with_vector(
             snippet,
             semantic_only,
             score,
+            source: None,
         });
     }
     // Votes can reorder memories that fused close together.
-    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.memory.id.cmp(&b.memory.id))
+    });
     hits.truncate(limit);
 
     let ids: Vec<i64> = hits.iter().map(|h| h.memory.id).collect();
+    let sources = db::sources_for(conn, &ids).map_err(|e| e.to_string())?;
+    for h in &mut hits {
+        h.source = sources.get(&h.memory.id).cloned();
+    }
     let _ = db::bump_access(conn, &ids);
     Ok(hits)
 }
@@ -235,14 +291,33 @@ fn first_line(s: &str) -> String {
     out
 }
 
+/// Last two path segments, so `C:\docs\a\b.md` prints as `a/b.md`.
+fn short_source(p: &str) -> String {
+    let parts: Vec<&str> = p.split(['\\', '/']).filter(|s| !s.is_empty()).collect();
+    parts[parts.len().saturating_sub(2)..].join("/")
+}
+
 /// Query tokens long enough to carry meaning, lowercased and deduplicated.
-/// Used to keep the OR fallback from matching on filler words.
+/// Function words are dropped so "how to train for a marathon" cannot match a
+/// document through "how" and "to".
 fn content_tokens(query: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "are", "but", "not", "you", "your", "all", "any",
+        "can", "had", "has", "have", "her", "his", "its", "may", "our", "out",
+        "was", "were", "who", "why", "how", "what", "when", "where", "which",
+        "while", "with", "from", "this", "that", "these", "those", "they",
+        "them", "their", "there", "then", "than", "into", "over", "under",
+        "about", "after", "before", "because", "would", "should", "could",
+        "will", "been", "being", "more", "most", "some", "such", "only",
+        "also", "just", "like", "does", "did", "doing", "one", "two", "how",
+        "using", "use", "used", "get", "got", "make", "made", "way",
+    ];
     let mut seen = std::collections::HashSet::new();
     query
         .split_whitespace()
         .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
-        .filter(|t| t.chars().count() >= 3 && seen.insert(t.clone()))
+        .filter(|t| t.chars().count() >= 3 && !STOPWORDS.contains(&t.as_str()))
+        .filter(|t| seen.insert(t.clone()))
         .collect()
 }
 
@@ -274,10 +349,15 @@ pub fn format_hits(hits: &[Hit]) -> String {
         } else {
             String::new()
         };
+        let source_tag = h
+            .source
+            .as_deref()
+            .map(|s| format!(" <- {}", short_source(s)))
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "[{}] ({}, {}{}) {}{}{} score={:.4}",
-            m.id, m.kind, project, scope, m.agent, tag, vote_tag, h.score
+            "[{}] ({}, {}{}) {}{}{}{} score={:.4}",
+            m.id, m.kind, project, scope, m.agent, tag, vote_tag, source_tag, h.score
         );
         let _ = writeln!(out, "    {}", h.snippet);
     }
@@ -346,7 +426,7 @@ mod tests {
 
     #[test]
     fn content_tokens_ignore_filler() {
-        assert_eq!(content_tokens("how do I write a haiku"), vec!["how", "write", "haiku"]);
+        assert_eq!(content_tokens("how do I write a haiku"), vec!["write", "haiku"]);
         assert!(content_tokens("a b c").is_empty());
         assert_eq!(content_tokens("Docker docker"), vec!["docker"]);
     }
@@ -359,15 +439,24 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_floor_scales_with_corpus() {
+        assert!(adaptive_floor(14) > 0.50);
+        assert!(adaptive_floor(14) < 0.64);
+        assert!(adaptive_floor(7056) > 0.60);
+        assert!(adaptive_floor(7056) < 0.74);
+        assert!(adaptive_floor(1_000_000) <= 0.78);
+    }
+
+    #[test]
     fn semantic_gate_keeps_only_strong_matches() {
         let mut v = vec![(1, 0.74), (2, 0.70), (3, 0.55), (4, 0.40)];
-        semantic_gate(&mut v);
+        semantic_gate(&mut v, 0.55);
         // 0.70 clears both floors; 0.55 fails the relative floor (0.74*0.85=0.629);
         // 0.40 fails the absolute floor.
         assert_eq!(v.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1, 2]);
 
         let mut none = vec![(9, 0.45)];
-        semantic_gate(&mut none);
+        semantic_gate(&mut none, 0.55);
         assert!(none.is_empty(), "noise-only query returns nothing");
     }
 }

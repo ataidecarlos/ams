@@ -20,6 +20,15 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// True for UNIQUE constraint failures (duplicate content in the active set).
+pub fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if err.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
 /// FNV-1a, 64-bit. Only used for exact duplicate detection, not security.
 pub fn content_hash(s: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -678,6 +687,48 @@ pub fn created_at_map(
     let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
     let mut stmt = conn.prepare(&format!(
         "SELECT id, created_at FROM memories WHERE id IN ({placeholders})"
+    ))?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(ids.iter()))?;
+    while let Some(r) = rows.next()? {
+        out.insert(r.get(0)?, r.get(1)?);
+    }
+    Ok(out)
+}
+
+/// How many memories this agent can currently see (expiry and downvote
+/// thresholds excluded). Used to scale the semantic similarity gate: the best
+/// score of an unrelated query rises with corpus size.
+pub fn visible_count(
+    conn: &Connection,
+    agent: &str,
+    project: Option<&str>,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM memories
+         WHERE status != 'archived'
+           AND (scope = 'shared' OR agent = ?1)
+           AND (?2 IS NULL OR project = ?2)
+           AND (expires_at IS NULL OR expires_at > ?3)",
+        params![agent, project, now()],
+        |r| r.get(0),
+    )
+}
+
+/// Source path recorded on the raw record for each memory id, when present
+/// (imported corpus docs carry their file path there).
+pub fn sources_for(
+    conn: &Connection,
+    ids: &[i64],
+) -> rusqlite::Result<std::collections::HashMap<i64, String>> {
+    let mut out = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT m.id, r.source_session FROM memories m
+         JOIN raw_memories r ON r.id = m.raw_id
+         WHERE m.id IN ({placeholders}) AND r.source_session != ''"
     ))?;
     let mut rows = stmt.query(rusqlite::params_from_iter(ids.iter()))?;
     while let Some(r) = rows.next()? {
